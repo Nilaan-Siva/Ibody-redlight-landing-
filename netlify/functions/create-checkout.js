@@ -8,6 +8,19 @@ const SITE_URL = "https://storied-figolla-9f1e75.netlify.app";
 const SQUARE_API_BASE = "https://connect.squareup.com/v2";
 const SQUARE_VERSION = "2025-01-23";
 
+// Square requires E.164 (e.g. +14161231234). Visitors type all sorts of
+// formats ("416-123-1234", "(416) 123-1234", "4161231234") — normalize
+// North American numbers so Square doesn't reject the whole request over
+// one field. Returns null (omit the field) if it doesn't look salvageable.
+function toE164(raw) {
+  const digits = String(raw || "").replace(/\D/g, "");
+  if (!digits) return null;
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  if (digits.length > 7) return `+${digits}`; // best-effort for non-NA numbers
+  return null;
+}
+
 export default async (req) => {
   const cors = {
     "Access-Control-Allow-Origin": "*",
@@ -85,30 +98,49 @@ export default async (req) => {
     const givenName = nameParts[0] || "";
     const familyName = nameParts.slice(1).join(" ");
 
-    const linkRes = await fetch(`${SQUARE_API_BASE}/online-checkout/payment-links`, {
-      method: "POST",
-      headers: squareHeaders,
-      body: JSON.stringify({
-        idempotency_key: crypto.randomUUID(),
-        quick_pay: {
-          name: itemName,
-          price_money: { amount, currency: "CAD" },
-          location_id: locationId,
-        },
-        checkout_options: {
-          redirect_url: redirectUrl,
-        },
-        pre_populated_data: {
-          buyer_email: email,
-          ...(phone ? { buyer_phone_number: phone } : {}),
-          ...(givenName
-            ? { buyer_address: { first_name: givenName, ...(familyName ? { last_name: familyName } : {}) } }
-            : {}),
-        },
-      }),
+    const buildBody = (phoneE164) => ({
+      idempotency_key: crypto.randomUUID(),
+      quick_pay: {
+        name: itemName,
+        price_money: { amount, currency: "CAD" },
+        location_id: locationId,
+      },
+      checkout_options: {
+        redirect_url: redirectUrl,
+      },
+      pre_populated_data: {
+        buyer_email: email,
+        ...(phoneE164 ? { buyer_phone_number: phoneE164 } : {}),
+        ...(givenName
+          ? { buyer_address: { first_name: givenName, ...(familyName ? { last_name: familyName } : {}) } }
+          : {}),
+      },
     });
 
-    const linkData = await linkRes.json();
+    const createLink = (body) =>
+      fetch(`${SQUARE_API_BASE}/online-checkout/payment-links`, {
+        method: "POST",
+        headers: squareHeaders,
+        body: JSON.stringify(body),
+      });
+
+    let linkRes = await createLink(buildBody(toE164(phone)));
+    let linkData = await linkRes.json();
+
+    // If Square still rejects the phone number specifically (a format we didn't
+    // anticipate), retry once without it rather than losing the whole checkout
+    // link — a pre-filled email is far better than falling back to the generic
+    // static link with nothing pre-filled at all.
+    const phoneRejected =
+      !linkRes.ok &&
+      Array.isArray(linkData?.errors) &&
+      linkData.errors.some((e) => e.field === "pre_populated_data.buyer_phone_number");
+
+    if (phoneRejected) {
+      console.error("create-checkout: Square rejected the phone number, retrying without it", linkData);
+      linkRes = await createLink(buildBody(null));
+      linkData = await linkRes.json();
+    }
 
     if (!linkRes.ok || !linkData.payment_link || !linkData.payment_link.url) {
       console.error("create-checkout: Square rejected the payment-link request", linkData);

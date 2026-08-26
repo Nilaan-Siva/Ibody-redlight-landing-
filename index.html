@@ -702,7 +702,28 @@ src="https://www.facebook.com/tr?id=918306584645396&ev=PageView&noscript=1"/></n
       msg.style.display = 'block';
       msg.style.color = '#1c7a3f';
       msg.textContent = '✓ Saved! Redirecting to secure checkout…';
-      location.href = dest;
+
+      // Fire InitiateCheckout at the real moment we hand them to Square, so Meta sees
+      // three distinct funnel steps (Lead -> InitiateCheckout -> Purchase) instead of
+      // guessing at the gap between form submit and payment.
+      var isPackage = String(offer).indexOf('249') !== -1;
+      var pixelFired = false;
+      try {
+        if (window.fbq) {
+          fbq('track', 'InitiateCheckout', {
+            value: isPackage ? 249 : 67,
+            currency: 'CAD',
+            content_name: offer
+          });
+          pixelFired = true;
+        }
+      } catch (e) {}
+
+      // Give the pixel beacon a beat to leave the browser — navigating immediately
+      // cancels the in-flight request and the event never lands. Skipped entirely when
+      // the pixel is blocked or missing, so an ad blocker can't slow down checkout.
+      if (pixelFired) { setTimeout(function(){ location.href = dest; }, 250); }
+      else { location.href = dest; }
     };
 
     var leadSave = (LEAD_ENDPOINT.indexOf('PASTE_') === 0)
